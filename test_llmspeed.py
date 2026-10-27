@@ -216,6 +216,34 @@ class LlmspeedTest(unittest.TestCase):
         self.assertEqual(cfg["base_url"], "https://inference.coralbricks.ai/v1")
         self.assertEqual(cfg["api_key_env"], "CORAL_API_KEY")
 
+    def test_reasoning_effort_cli(self):
+        args = llmspeed.parse_args(
+            [
+                "--provider",
+                "coralbricks",
+                "--model",
+                "m",
+                "--reasoning-effort",
+                "high",
+            ]
+        )
+        cfg = llmspeed.build_config(args, {})
+        self.assertEqual(cfg["reasoning_effort"], "high")
+        body = llmspeed.build_body("m", {"name": "x", "messages": []}, "high")
+        self.assertEqual(body["reasoning_effort"], "high")
+        override = llmspeed.build_body(
+            "m", {"name": "x", "messages": [], "reasoning_effort": "low"}, "high"
+        )
+        self.assertEqual(override["reasoning_effort"], "high")
+
+        plain = llmspeed.build_config(
+            llmspeed.parse_args(["--model", "m"]), {}
+        )
+        self.assertIsNone(plain["reasoning_effort"])
+        self.assertNotIn(
+            "reasoning_effort", llmspeed.build_body("m", {"name": "x", "messages": []})
+        )
+
     def test_unknown_provider(self):
         args = llmspeed.parse_args(["--provider", "nope", "--model", "m"])
         with self.assertRaises(llmspeed.SpeedError):
@@ -232,7 +260,7 @@ class LlmspeedTest(unittest.TestCase):
             args = llmspeed.parse_args(
                 ["--provider", "custom", "--base-url", self.base_url, "-c", str(target)]
             )
-            with mock.patch("builtins.input", side_effect=["2", "y"]), mock.patch(
+            with mock.patch("builtins.input", side_effect=["", "2", "y"]), mock.patch(
                 "llmspeed.getpass.getpass", return_value="test-key"
             ), mock.patch.dict(os.environ, {"LLMSPEED_API_KEY": "", "OPENAI_API_KEY": ""}), contextlib.redirect_stdout(
                 io.StringIO()

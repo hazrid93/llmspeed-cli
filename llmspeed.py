@@ -156,9 +156,11 @@ def list_models(base_url, api_key, timeout=30):
     return models
 
 
-def build_body(model, scenario):
+def build_body(model, scenario, reasoning_effort=None):
     body = {key: value for key, value in scenario.items() if key != "name"}
     body["model"] = model
+    if reasoning_effort:
+        body["reasoning_effort"] = reasoning_effort
     body.setdefault("messages", [])
     body["stream"] = True
     body.setdefault("stream_options", {"include_usage": True})
@@ -212,7 +214,7 @@ def open_stream(url, body, api_key, timeout):
 def run_once(cfg, scenario, timeout=DEFAULT_TIMEOUT):
     """Run one request and return its measurements."""
     url = chat_url(cfg["base_url"])
-    body = build_body(cfg["model"], scenario)
+    body = build_body(cfg["model"], scenario, cfg.get("reasoning_effort"))
     start = time.perf_counter()
     response = open_stream(url, body, cfg.get("api_key"), timeout)
 
@@ -566,15 +568,19 @@ def interactive_setup(args, conf):
             print("Available models:")
             for index, model_id in enumerate(models, 1):
                 print(f"  {index}. {model_id}")
-            choice = ask("Model", models[0])
-            if choice.isdigit() and 1 <= int(choice) <= len(models):
-                model = models[int(choice) - 1]
-            else:
-                model = choice
+            while not model:
+                choice = input("Model (number or id): ").strip()
+                if not choice:
+                    print("Select a model.")
+                elif choice.isdigit() and 1 <= int(choice) <= len(models):
+                    model = models[int(choice) - 1]
+                else:
+                    model = choice
         else:
-            model = ask("Model id")
-        if not model:
-            raise SpeedError("no model selected")
+            while not model:
+                model = input("Model id: ").strip()
+                if not model:
+                    print("Enter a model id.")
 
     updated = dict(conf)
     updated.update(
@@ -662,6 +668,7 @@ def build_config(args, conf):
         "model": str(model),
         "api_key": api_key,
         "api_key_env": key_env,
+        "reasoning_effort": args.reasoning_effort,
         "runs": runs,
         "timeout": timeout,
     }
@@ -693,6 +700,8 @@ def parse_args(argv):
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="examples:\n"
         "  llmspeed.py --provider coralbricks\n"
+        "  llmspeed.py --provider coralbricks --model deepseek-v4.1-flash-fast "
+        "--reasoning-effort high\n"
         "  llmspeed.py --base-url https://api.openai.com/v1 --model gpt-4.1-mini\n"
         "  llmspeed.py --config speedtest.json --runs 5\n"
         "  llmspeed.py --config speedtest.json --scenario chat --json\n",
@@ -701,7 +710,7 @@ def parse_args(argv):
         "-c", "--config", help="JSON config file (default: ./speedtest.json if it exists)"
     )
     parser.add_argument("--base-url", help="API root, for example https://host/v1")
-    parser.add_argument("--model", help="model name")
+    parser.add_argument("--model", help="model name; skips the model prompt")
     parser.add_argument(
         "--provider", help="provider preset: coralbricks or custom"
     )
@@ -714,6 +723,11 @@ def parse_args(argv):
         action="append",
         metavar="NAME",
         help="run only this scenario (repeatable)",
+    )
+    parser.add_argument(
+        "--reasoning-effort",
+        metavar="VALUE",
+        help="reasoning effort for every request, for example low, high, or max",
     )
     parser.add_argument("--runs", type=int, help="requests per scenario (default 3)")
     parser.add_argument("--timeout", type=float, help="request timeout in seconds")

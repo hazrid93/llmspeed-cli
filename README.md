@@ -34,7 +34,11 @@ export CORAL_API_KEY=cb_...
 python3 llmspeed.py --provider coralbricks
 ```
 
-The tool asks for a model from the endpoint model list.
+The tool asks you to select a model from the endpoint model list. To skip the prompt, put the model on the command line:
+
+```bash
+python3 llmspeed.py --provider coralbricks --model deepseek-v4.1-flash-fast
+```
 
 OpenAI:
 
@@ -60,11 +64,13 @@ Known providers set the endpoint and the API key variable:
 
 Use `--provider NAME`. For a custom endpoint, also set `--base-url`.
 
+Set `--model NAME` to skip the model prompt. A test runs one model. If no model is set, the tool asks you to select one. It does not test all models.
+
 If no model is configured and the terminal is interactive, the tool asks for the provider, the API key, and a model. It reads the model list from `GET /models`. It can save the result to `speedtest.json`. The setup wizard does not write the API key to the file.
 
 CoralBricks docs: https://www.coralbricks.ai/docs
 
-The shared models are `deepseek-v4.1-flash-fast` and `deepseek-v4.1-flash`. Add `"reasoning_effort": "high"` to a scenario to measure reasoning tokens.
+The shared models are `deepseek-v4.1-flash-fast` and `deepseek-v4.1-flash`. Add `"reasoning_effort": "high"` to a scenario, or use `--reasoning-effort high`. The flag applies to every selected scenario. Use `--scenario reasoning` to measure only the reasoning prompt.
 
 ## Configuration
 

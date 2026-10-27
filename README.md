@@ -40,14 +40,19 @@ python3 llmspeed.py --help
 
 | Option | Meaning |
 | --- | --- |
+| `-h`, `--help` | Show options and examples. |
+| `-c`, `--config FILE` | Read a JSON config file. |
 | `--provider NAME` | Provider preset: `coralbricks` or `custom`. |
 | `--base-url URL` | API root for any endpoint. |
 | `--model NAME` | Model name. Skips the model prompt. |
+| `--api-key KEY` | API key. Prefer an environment variable. |
+| `--api-key-env NAME` | Environment variable that holds the API key. |
 | `--reasoning-effort VALUE` | Reasoning effort for every selected scenario. |
 | `--scenario NAME` | Run only this scenario. Repeatable. |
 | `--runs N` | Requests per scenario. Default `3`. |
+| `--timeout SECONDS` | Timeout for each request. Default `120`. |
 | `--json` | Print JSON only. |
-| `--config FILE` | Read a JSON config file. |
+| `--version` | Show the tool version. |
 
 Examples:
 
@@ -107,39 +112,53 @@ llmspeed 0.1.0 · deepseek-v4.1-flash-fast
 https://inference.coralbricks.ai/v1 · 3 run(s) per scenario
 
 chat · median of 3
-  TTFT ................ 1.23 s
-  first content ....... 1.23 s
-  prefill ............. 13.9 tok/s  (17 prompt tok)
-  output .............. 228 tok/s  (199 tok)
-  end-to-end .......... 2.22 s
-
-tool-call · median of 3
-  TTFT ................ 1.48 s
-  first content ....... 1.48 s
-  tool call ready ..... 1.56 s  (get_weather)
-  prefill ............. 187 tok/s  (276 prompt tok)
-  output .............. 710 tok/s  (52 tok)
-  end-to-end .......... 1.56 s
+  TTFT ................ 1.39 s
+  TTFT p95 ............ 1.58 s
+  first content ....... 1.39 s
+  first usable ........ 1.39 s
+  prefill ............. 12.2 tok/s  (17 prompt tok)
+  output .............. 298 tok/s  (206 tok)
+  TPOT ................ 3.4 ms
+  decode time ......... 687 ms
+  chunk gap p95 ....... 29 ms
+  max chunk gap ....... 166 ms
+  visible stall p95 ... 29 ms
+  cache hit ........... 0.0%
+  cost ................ $0.000249
+  end-to-end .......... 2.07 s
+  E2E p95 ............. 2.32 s
 ```
 
+This is one measured example, not a benchmark guarantee. Run at least 20 times for a useful p95.
+
 Rates are effective. Network delay and queue time are part of TTFT.
+
+Exit codes: `0` for success, `1` for a request error, and `2` for a configuration or setup error.
 
 ## Metrics
 
 | Metric | Meaning |
 | --- | --- |
-| TTFT | Time to the first token of any type. |
-| First content | Time to the first visible token. |
-| Tool call ready | Time to the complete tool call. |
-| Prefill | Prompt tokens divided by TTFT. |
-| Output | Completion tokens divided by the time from the first token to the end of the stream. |
-| Reasoning | Reasoning tokens and their rate. |
-| Content | Completion tokens minus reasoning tokens, divided by the time from first content to the end of the stream. |
-| End-to-end | Time from the request to the last stream event. |
+| TTFT | Time from request start to the first content, reasoning, or tool-call event. |
+| First content | Time to the first non-whitespace content. Tool-only responses show `n/a`. |
+| First usable | The earlier of first content or a complete tool call. This is not task completion. |
+| Tool call ready | Time to the finish event with complete tool-call arguments. |
+| Prefill | Prompt tokens divided by TTFT. This effective rate includes network and queue time. |
+| Output | `(completion tokens - 1) / (last output event - first output event)`. |
+| TPOT | Decode time divided by `(completion tokens - 1)`. It excludes TTFT. |
+| Reasoning | Reasoning tokens after the first, divided by the reasoning event span. |
+| Content | Content tokens after the first, divided by the content event span. It is `n/a` for mixed content and tool calls. |
+| Decode time | Time from the first output event to the last output event. |
+| Chunk gap p50/p95/max | Percentiles and maximum of delays between output SSE events. |
+| Visible stall p95 | p95 of delays between non-whitespace content events. |
+| TTFT/E2E p95 | Tail latency across successful runs. Use at least 20 runs for a useful tail measurement. |
+| Cache hit | Cached prompt tokens divided by total prompt tokens. |
+| Cost | Request cost from `usage.cost`, when the provider reports it. |
+| End-to-end | Time from request start to `[DONE]` or stream close. |
 
-The output shows the median of the runs. Token counts come from `usage`. If the endpoint does not send `usage`, the tool estimates the count and marks the rate with `~`.
+The output shows median run values and p95 TTFT/E2E. Cost is the median per request, not the total. Token rates require token counts from `usage`. Without `usage`, token counts and token rates show `n/a`. Chunk-gap metrics remain available.
 
-llmspeed does not execute tools. The tool-call value stops when the tool call is complete. Token counts can differ from provider dashboards.
+A provider can put multiple tokens in one SSE event. Token rates and chunk gaps are effective client-side measurements, not engine-internal metrics. llmspeed does not execute tools. Repeated runs can warm the prompt cache.
 
 ## Tests
 

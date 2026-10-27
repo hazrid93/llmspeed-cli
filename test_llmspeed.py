@@ -16,6 +16,46 @@ from unittest import mock
 import llmspeed
 
 
+class FakeResponse:
+    def __init__(self, events):
+        self.lines = [
+            line.encode()
+            for event in [*events, "[DONE]"]
+            for line in (
+                f"data: {json.dumps(event) if isinstance(event, dict) else event}\n",
+                "\n",
+            )
+        ]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+    def __iter__(self):
+        return iter(self.lines)
+
+
+def metric_clock(events, stamps):
+    """Timestamp each SSE frame and the final DONE and stream close."""
+    assert len(events) == len(stamps)
+    values = [0]
+    for stamp in stamps:
+        values.extend([stamp, stamp])
+    values.extend([stamps[-1] + 0.1, stamps[-1] + 0.1, stamps[-1] + 0.2])
+    return iter(values)
+
+
+def event(delta=None, finish_reason=None, **extra):
+    return {
+        "choices": [
+            {"delta": delta or {}, "finish_reason": finish_reason}
+        ],
+        **extra,
+    }
+
+
 class MockStream(BaseHTTPRequestHandler):
     """Stream a reasoning answer, or a tool call if the request has tools."""
 
@@ -175,18 +215,256 @@ class LlmspeedTest(unittest.TestCase):
         self.assertGreater(sample["output_tps"], 0)
         self.assertGreater(sample["reasoning_tps"], 0)
         self.assertGreater(sample["content_tps"], 0)
-        self.assertFalse(sample["estimated"])
         self.assertEqual(sample["finish_reason"], "stop")
 
-    def test_estimate_without_usage(self):
+    def test_exact_metric_boundaries(self):
+        events = [
+            event({"role": "assistant"}),
+            event({"reasoning_content": "Think"}),
+            event({"reasoning_content": " more"}),
+            event({"content": "Answer"}),
+            event({"content": " done"}),
+            event(finish_reason="stop"),
+            {
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 9,
+                    "prompt_tokens_details": {
+                        "cached_tokens": 25,
+                        "cache_write_tokens": 75,
+                    },
+                    "completion_tokens_details": {"reasoning_tokens": 4},
+                    "cost": 0.001234,
+                },
+            },
+        ]
+        with mock.patch(
+            "llmspeed.open_stream", return_value=FakeResponse(events)
+        ), mock.patch(
+            "llmspeed.time.perf_counter",
+            side_effect=metric_clock(events, [0.1, 0.2, 0.3, 0.6, 0.7, 0.95, 1.0]),
+        ):
+            sample = llmspeed.run_once(
+                {"base_url": "http://unused/v1", "model": "mock"},
+                {"name": "exact", "messages": []},
+            )
+        expected = {
+            "ttft_ms": 200,
+            "first_content_ms": 600,
+            "first_usable_ms": 600,
+            "visible_stall_p95_ms": 100,
+            "e2e_ms": 1200,
+            "decode_ms": 500,
+            "prefill_tps": 500,
+            "output_tps": 16,
+            "tpot_ms": 62.5,
+            "reasoning_tps": 30,
+            "content_tps": 40,
+            "inter_chunk_p50_ms": 100,
+            "inter_chunk_p95_ms": 280,
+            "inter_chunk_max_ms": 300,
+            "cache_hit_percent": 25,
+            "cached_tokens": 25,
+            "cache_write_tokens": 75,
+            "cost_usd": 0.001234,
+        }
+        for key, value in expected.items():
+            self.assertAlmostEqual(sample[key], value, msg=key)
+
+    def test_tool_arguments_must_be_complete(self):
+        events = [
+            event(
+                {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_1",
+                            "function": {"name": "f", "arguments": '{"x":'},
+                        }
+                    ]
+                }
+            ),
+            event(
+                {
+                    "tool_calls": [
+                        {"index": 0, "function": {"arguments": " 1}"}}
+                    ]
+                }
+            ),
+            event(finish_reason="tool_calls"),
+            {"choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 4}},
+        ]
+        with mock.patch(
+            "llmspeed.open_stream", return_value=FakeResponse(events)
+        ), mock.patch(
+            "llmspeed.time.perf_counter",
+            side_effect=metric_clock(events, [0.1, 0.2, 0.3, 0.4]),
+        ):
+            sample = llmspeed.run_once(
+                {"base_url": "http://unused/v1", "model": "mock"},
+                {"name": "tool", "messages": []},
+            )
+        self.assertEqual(sample["ttft_ms"], 100)
+        self.assertEqual(sample["tool_ready_ms"], 300)
+        self.assertEqual(sample["output_tps"], 30)
+        self.assertIsNone(sample["first_content_ms"])
+
+        incomplete = events[:1] + [event(finish_reason="tool_calls")]
+        with mock.patch(
+            "llmspeed.open_stream", return_value=FakeResponse(incomplete)
+        ), mock.patch(
+            "llmspeed.time.perf_counter",
+            side_effect=metric_clock(incomplete, [0.1, 0.2]),
+        ), self.assertRaisesRegex(
+            llmspeed.SpeedError, "incomplete"
+        ):
+            llmspeed.run_once(
+                {"base_url": "http://unused/v1", "model": "mock"},
+                {"name": "tool", "messages": []},
+            )
+
+    def test_multiline_sse_and_same_event_tool_finish(self):
+        class MultilineResponse(FakeResponse):
+            def __init__(self):
+                payload = json.dumps(
+                    event(
+                        {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "function": {"name": "f", "arguments": '{"x":1}'},
+                                }
+                            ]
+                        },
+                        finish_reason="tool_calls",
+                    )
+                )
+                self.lines = [
+                    f"data: {line}\n".encode()
+                    for line in payload.split(" ")
+                ] + [b"\n", b"data: [DONE]\n", b"\n"]
+
+        with mock.patch(
+            "llmspeed.open_stream", return_value=MultilineResponse()
+        ), mock.patch(
+            "llmspeed.time.perf_counter",
+            side_effect=[0] + [0.1] * 20,
+        ):
+            sample = llmspeed.run_once(
+                {"base_url": "http://unused/v1", "model": "mock"},
+                {"name": "tool", "messages": []},
+            )
+        self.assertEqual(sample["ttft_ms"], 100)
+        self.assertEqual(sample["tool_ready_ms"], 100)
+        self.assertEqual(sample["first_usable_ms"], 100)
+
+    def test_truncated_tool_stream_is_an_error(self):
+        response = FakeResponse(
+            [
+                event(
+                    {
+                        "tool_calls": [
+                            {"index": 0, "function": {"arguments": '{"x":'}}
+                        ]
+                    }
+                ),
+                event(finish_reason="length"),
+            ]
+        )
+        with mock.patch("llmspeed.open_stream", return_value=response), mock.patch(
+            "llmspeed.time.perf_counter", side_effect=[0] + [0.1] * 20
+        ), self.assertRaisesRegex(llmspeed.SpeedError, "incomplete"):
+            llmspeed.run_once(
+                {"base_url": "http://unused/v1", "model": "mock"},
+                {"name": "tool", "messages": []},
+            )
+
+    def test_mixed_tool_content_does_not_inflate_content_rate(self):
+        events = [
+            event({"content": "Calling a tool"}),
+            event(
+                {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "function": {"name": "f", "arguments": "{}"},
+                        }
+                    ]
+                }
+            ),
+            event(finish_reason="tool_calls"),
+            {"choices": [], "usage": {"prompt_tokens": 3, "completion_tokens": 8}},
+        ]
+        with mock.patch(
+            "llmspeed.open_stream", return_value=FakeResponse(events)
+        ), mock.patch(
+            "llmspeed.time.perf_counter",
+            side_effect=metric_clock(events, [0.1, 0.2, 0.3, 0.4]),
+        ):
+            sample = llmspeed.run_once(
+                {"base_url": "http://unused/v1", "model": "mock"},
+                {"name": "mixed", "messages": []},
+            )
+        self.assertIsNone(sample["content_tokens"])
+        self.assertIsNone(sample["content_tps"])
+        self.assertGreater(sample["output_tps"], 0)
+
+    def test_zero_usage_never_produces_negative_rates(self):
+        self.assertIsNone(llmspeed.rate(-1, 1))
+        self.assertIsNone(llmspeed.rate(0, 1))
+        self.assertIsNone(llmspeed.rate(1, 0))
+
+    def test_first_content_ignores_whitespace(self):
+        events = [
+            event({"content": "\n\n"}),
+            event({"content": "Hello"}),
+            {"choices": [], "usage": {"prompt_tokens": 2, "completion_tokens": 2}},
+        ]
+        with mock.patch(
+            "llmspeed.open_stream", return_value=FakeResponse(events)
+        ), mock.patch(
+            "llmspeed.time.perf_counter",
+            side_effect=metric_clock(events, [0.1, 0.3, 0.4]),
+        ):
+            sample = llmspeed.run_once(
+                {"base_url": "http://unused/v1", "model": "mock"},
+                {"name": "chat", "messages": []},
+            )
+        self.assertEqual(sample["ttft_ms"], 100)
+        self.assertEqual(sample["first_content_ms"], 300)
+        self.assertEqual(sample["output_tps"], 5)
+        self.assertIsNone(sample["visible_stall_p95_ms"])
+
+    def test_tail_latency_and_cost_aggregation(self):
+        samples = [
+            {
+                "ttft_ms": value,
+                "e2e_ms": value * 2,
+                "cost_usd": cost,
+                "cache_hit_percent": 50,
+            }
+            for value, cost in zip([100, 200, 300, 400], [0.0001, 0.0002, 0.0003, 0.0004])
+        ]
+        self.assertEqual(llmspeed.percentile_ms(samples, "ttft_ms", 0.95), 385)
+        self.assertEqual(llmspeed.percentile_ms(samples, "e2e_ms", 0.95), 770)
+        median = llmspeed.aggregate(samples)
+        self.assertEqual(median["cost_usd"], 0.00025)
+        self.assertEqual(median["cache_hit_percent"], 50)
+
+    def test_missing_usage_disables_token_rates(self):
         cfg = dict(self.cfg, model="no-usage")
         sample = llmspeed.run_once(cfg, llmspeed.BUILTIN_SCENARIOS[0], 10)
-        self.assertTrue(sample["estimated"])
         self.assertIsNone(sample["prompt_tokens"])
+        self.assertIsNone(sample["completion_tokens"])
+        self.assertIsNone(sample["reasoning_tokens"])
         self.assertIsNone(sample["prefill_tps"])
-        self.assertEqual(sample["completion_tokens"], 4)
-        self.assertEqual(sample["reasoning_tokens"], 2)
-        self.assertGreater(sample["output_tps"], 0)
+        self.assertIsNone(sample["output_tps"])
+        self.assertIsNone(sample["reasoning_tps"])
+        self.assertIsNone(sample["content_tps"])
+        self.assertIsNone(sample["tpot_ms"])
+        self.assertEqual(sample["output_chunks"], 4)
+        self.assertIsNotNone(sample["inter_chunk_p95_ms"])
 
     def test_tool_call_ready(self):
         sample = llmspeed.run_once(self.cfg, llmspeed.BUILTIN_SCENARIOS[2], 10)
@@ -200,7 +478,6 @@ class LlmspeedTest(unittest.TestCase):
         cfg = dict(self.cfg, model="retry")
         sample = llmspeed.run_once(cfg, llmspeed.BUILTIN_SCENARIOS[0], 10)
         self.assertEqual(sample["completion_tokens"], 10)
-        self.assertFalse(sample["estimated"])
 
     def test_max_completion_tokens(self):
         body = llmspeed.build_body(
@@ -361,6 +638,26 @@ class LlmspeedTest(unittest.TestCase):
         self.assertEqual(raised.exception.code, 0)
         self.assertIn("--reasoning-effort", stdout.getvalue())
 
+    def test_human_output_includes_new_metrics(self):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+            code = llmspeed.main(
+                [
+                    "--base-url",
+                    self.base_url,
+                    "--model",
+                    "mock",
+                    "--runs",
+                    "2",
+                    "--scenario",
+                    "chat",
+                ]
+            )
+        self.assertEqual(code, 0)
+        output = stdout.getvalue()
+        for label in ("first usable", "TPOT", "decode time", "E2E p95"):
+            self.assertIn(label, output)
+
     def test_json_cli(self):
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
@@ -383,6 +680,12 @@ class LlmspeedTest(unittest.TestCase):
         sample = payload["results"][0]["samples"][0]
         self.assertEqual(sample["completion_tokens"], 10)
         self.assertEqual(payload["results"][0]["median"]["ttft_ms"], sample["ttft_ms"])
+        self.assertEqual(
+            payload["results"][0]["p95"]["e2e_ms"], sample["e2e_ms"]
+        )
+        self.assertEqual(
+            sample["first_usable_ms"], sample["first_content_ms"]
+        )
 
 
 if __name__ == "__main__":

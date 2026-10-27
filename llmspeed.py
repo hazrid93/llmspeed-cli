@@ -12,6 +12,7 @@ import argparse
 import getpass
 import http.client
 import json
+import math
 import os
 import statistics
 import sys
@@ -46,17 +47,33 @@ CUSTOM_PROVIDER = {
 NUMERIC_KEYS = (
     "ttft_ms",
     "first_content_ms",
+    "first_usable_ms",
     "tool_ready_ms",
     "e2e_ms",
-    "prompt_tokens",
-    "completion_tokens",
-    "reasoning_tokens",
+    "decode_ms",
+    "inter_chunk_p50_ms",
+    "inter_chunk_p95_ms",
+    "inter_chunk_max_ms",
+    "visible_stall_p95_ms",
     "prefill_tps",
     "output_tps",
     "reasoning_tps",
     "content_tps",
+    "tpot_ms",
+    "prompt_tokens",
+    "completion_tokens",
+    "reasoning_tokens",
+    "cached_tokens",
+    "cache_write_tokens",
+    "cost_usd",
 )
-TOKEN_KEYS = {"prompt_tokens", "completion_tokens", "reasoning_tokens"}
+TOKEN_KEYS = {
+    "prompt_tokens",
+    "completion_tokens",
+    "reasoning_tokens",
+    "cached_tokens",
+    "cache_write_tokens",
+}
 
 BUILTIN_SCENARIOS = [
     {
@@ -211,6 +228,56 @@ def open_stream(url, body, api_key, timeout):
             raise SpeedError(f"cannot connect to {url}: {error.reason}") from None
 
 
+def round_ms(seconds):
+    return round(seconds * 1000, 1) if seconds is not None else None
+
+
+def round_value(value):
+    return round(value, 1) if value is not None else None
+
+
+def rate(tokens, seconds):
+    if tokens is None or tokens <= 0 or seconds is None or seconds <= 0:
+        return None
+    return round_value(tokens / seconds)
+
+
+def percentile(values, quantile):
+    """Linear percentile, matching common latency percentile conventions."""
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * quantile
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    fraction = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+
+def iter_sse(response, started):
+    """Yield decoded SSE events at the time their terminating line arrives."""
+    data = []
+    done = False
+    for raw in response:
+        now = time.perf_counter()
+        line = raw.decode("utf-8", "replace").rstrip("\r\n")
+        if not line:
+            if data:
+                yield "\n".join(data), now - started
+                data = []
+        elif line.startswith("data:"):
+            data.append(line[5:].lstrip(" "))
+            if data[-1] == "[DONE]":
+                done = True
+    if data and not done:
+        yield "\n".join(data), now - started
+
+
+def percentile_ms(samples, key, quantile):
+    values = sorted(sample[key] for sample in samples if sample.get(key) is not None)
+    if not values:
+        return None
+    return round(percentile(values, quantile), 1)
+
+
 def run_once(cfg, scenario, timeout=DEFAULT_TIMEOUT):
     """Run one request and return its measurements."""
     url = chat_url(cfg["base_url"])
@@ -221,31 +288,38 @@ def run_once(cfg, scenario, timeout=DEFAULT_TIMEOUT):
     ttft = None
     first_content = None
     tool_ready = None
-    last_tool_at = None
     tool_name = None
     finish_reason = None
     prompt_tokens = None
     completion_tokens = None
     reasoning_tokens = None
+    cached_tokens = None
+    cache_write_tokens = None
+    cost_usd = None
+    first_content_chunk = None
+    last_content_chunk = None
+    first_reasoning_chunk = None
+    last_reasoning_chunk = None
+    last_output_at = None
+    output_events = 0
+    chunk_gaps = []
+    content_chunk_times = []
     content_chunks = 0
     reasoning_chunks = 0
     tool_chunks = 0
-    tool_chars = 0
+    arguments_by_call = {}
 
     try:
         with response:
-            for raw in response:
-                now = time.perf_counter()
-                line = raw.decode("utf-8", "replace").strip()
-                if not line.startswith("data:"):
-                    continue
-                payload = line[5:].strip()
+            for payload, elapsed in iter_sse(response, start):
                 if payload == "[DONE]":
                     break
                 try:
                     event = json.loads(payload)
-                except json.JSONDecodeError:
-                    continue
+                except json.JSONDecodeError as error:
+                    raise SpeedError(f"invalid stream event: {error}") from None
+                if event.get("error"):
+                    raise SpeedError(f"stream error: {json.dumps(event['error'])[:400]}")
 
                 usage = event.get("usage")
                 if usage:
@@ -258,6 +332,12 @@ def run_once(cfg, scenario, timeout=DEFAULT_TIMEOUT):
                         "reasoning_tokens",
                         usage.get("reasoning_tokens", reasoning_tokens),
                     )
+                    prompt_details = usage.get("prompt_tokens_details") or {}
+                    cached_tokens = prompt_details.get("cached_tokens", cached_tokens)
+                    cache_write_tokens = prompt_details.get(
+                        "cache_write_tokens", cache_write_tokens
+                    )
+                    cost_usd = usage.get("cost", cost_usd)
 
                 choices = event.get("choices") or []
                 if not choices:
@@ -270,7 +350,8 @@ def run_once(cfg, scenario, timeout=DEFAULT_TIMEOUT):
                     isinstance(delta.get(key), str) and delta.get(key)
                     for key in ("reasoning_content", "reasoning", "thinking")
                 )
-                is_content = isinstance(delta.get("content"), str) and delta.get("content")
+                content_text = delta.get("content")
+                is_content = isinstance(content_text, str) and bool(content_text)
                 tool_deltas = [
                     call
                     for call in (delta.get("tool_calls") or [])
@@ -278,27 +359,46 @@ def run_once(cfg, scenario, timeout=DEFAULT_TIMEOUT):
                 ]
 
                 if finish_reason == "tool_calls" and tool_chunks:
-                    tool_ready = now - start
+                    tool_ready = elapsed
                 if not (is_reasoning or is_content or tool_deltas):
                     continue
                 if ttft is None:
-                    ttft = now - start
+                    ttft = elapsed
+                if last_output_at is not None:
+                    chunk_gaps.append(elapsed - last_output_at)
+                last_output_at = elapsed
+                output_events += 1
 
                 if is_reasoning:
                     reasoning_chunks += 1
+                    if first_reasoning_chunk is None:
+                        first_reasoning_chunk = elapsed
+                    last_reasoning_chunk = elapsed
                 if is_content:
                     content_chunks += 1
-                    if first_content is None:
-                        first_content = now - start
+                    if first_content_chunk is None:
+                        first_content_chunk = elapsed
+                    if content_text.strip():
+                        content_chunk_times.append(elapsed)
+                        if first_content is None:
+                            first_content = elapsed
+                    last_content_chunk = elapsed
                 for call in tool_deltas:
                     tool_chunks += 1
-                    last_tool_at = now - start
                     function = call.get("function") or {}
                     name = (function.get("name") or "").strip()
                     if name:
                         tool_name = name
-                    tool_chars += len(function.get("arguments") or "")
-    except (OSError, http.client.HTTPException) as error:
+                    call_id = (
+                        call["index"] if "index" in call else call.get("id", 0)
+                    )
+                    arguments = function.get("arguments") or ""
+                    arguments_by_call[call_id] = (
+                        arguments_by_call.get(call_id, "") + arguments
+                    )
+                if finish_reason == "tool_calls" and tool_ready is None:
+                    tool_ready = elapsed
+    except (OSError, http.client.HTTPException, TimeoutError) as error:
         elapsed = time.perf_counter() - start
         raise SpeedError(f"stream failed after {elapsed:.1f} s: {error}") from None
 
@@ -308,71 +408,108 @@ def run_once(cfg, scenario, timeout=DEFAULT_TIMEOUT):
             "no streamed tokens. Check that the endpoint supports stream=true "
             "and that the model name is correct."
         )
-    if tool_chunks and tool_ready is None:
-        tool_ready = last_tool_at
+    if tool_chunks:
+        if finish_reason != "tool_calls" or tool_ready is None:
+            raise SpeedError("tool call is incomplete")
+        for arguments in arguments_by_call.values():
+            try:
+                parsed_arguments = json.loads(arguments or "{}")
+            except json.JSONDecodeError:
+                raise SpeedError("tool-call arguments are incomplete") from None
+            if not isinstance(parsed_arguments, dict):
+                raise SpeedError("tool-call arguments must form an object")
 
-    estimated = False
-    if not completion_tokens:
-        # ponytail: chunk counts approximate tokens without usage data. Exact
-        # counts need a tokenizer or provider support.
-        estimated = True
-        tool_tokens = round(tool_chars / 4) if tool_chars else 0
-        completion_tokens = (
-            content_chunks + reasoning_chunks + max(tool_tokens, 1 if tool_chunks else 0)
-        )
-    if reasoning_tokens is None:
-        if reasoning_chunks:
-            reasoning_tokens = reasoning_chunks
-            estimated = True
-        else:
-            reasoning_tokens = 0
-    reasoning_tokens = max(0, min(reasoning_tokens, completion_tokens))
+    if completion_tokens is not None and reasoning_tokens is None and not reasoning_chunks:
+        reasoning_tokens = 0
+    content_tokens = None
+    if completion_tokens is not None and reasoning_tokens is not None:
+        reasoning_tokens = max(0, min(reasoning_tokens, completion_tokens))
+        content_tokens = completion_tokens - reasoning_tokens
 
-    prefill_tps = prompt_tokens / ttft if prompt_tokens and ttft > 0 else None
-    output_tps = (
-        completion_tokens / (end - ttft)
-        if completion_tokens and end > ttft
+    decode_seconds = last_output_at - ttft
+    prefill_tps = rate(prompt_tokens, ttft)
+    output_tps = rate(
+        completion_tokens - 1 if completion_tokens is not None else None,
+        decode_seconds,
+    )
+    tpot_ms = (
+        round(decode_seconds * 1000 / (completion_tokens - 1), 1)
+        if completion_tokens and completion_tokens > 1 and decode_seconds > 0
         else None
     )
-    visible_at = first_content if first_content is not None else tool_ready
-    reasoning_tps = (
-        reasoning_tokens / (visible_at - ttft)
-        if reasoning_tokens and visible_at is not None and visible_at > ttft
-        else None
+    reasoning_tps = rate(
+        reasoning_tokens - 1
+        if reasoning_tokens is not None and first_reasoning_chunk is not None
+        else reasoning_tokens,
+        last_reasoning_chunk - first_reasoning_chunk
+        if first_reasoning_chunk is not None
+        else None,
     )
-    # ponytail: the content split is completion minus reasoning, because
-    # providers do not report content tokens separately.
-    content_tokens = completion_tokens - reasoning_tokens
-    content_tps = (
-        content_tokens / (end - first_content)
-        if content_tokens and first_content is not None and end > first_content
+    content_tps = rate(
+        content_tokens - 1
+        if content_tokens is not None and first_content_chunk is not None
+        else content_tokens,
+        last_content_chunk - first_content_chunk
+        if first_content_chunk is not None
+        else None,
+    )
+    if tool_chunks:
+        content_tokens = None
+        content_tps = None
+    visible_gaps = [
+        later - earlier
+        for earlier, later in zip(content_chunk_times, content_chunk_times[1:])
+    ]
+    usable_times = [
+        value for value in (first_content, tool_ready) if value is not None
+    ]
+    cache_hit_percent = (
+        round(cached_tokens * 100 / prompt_tokens, 1)
+        if cached_tokens is not None and prompt_tokens
         else None
     )
 
     return {
-        "ttft_ms": round(ttft * 1000, 1),
-        "first_content_ms": (
-            round(first_content * 1000, 1) if first_content is not None else None
-        ),
-        "tool_ready_ms": (
-            round(tool_ready * 1000, 1) if tool_ready is not None else None
-        ),
+        "ttft_ms": round_ms(ttft),
+        "first_content_ms": round_ms(first_content),
+        "first_usable_ms": round_ms(min(usable_times) if usable_times else None),
+        "tool_ready_ms": round_ms(tool_ready),
         "tool_name": tool_name,
-        "e2e_ms": round(end * 1000, 1),
+        "e2e_ms": round_ms(end),
+        "decode_ms": round_ms(decode_seconds),
+        "inter_chunk_p50_ms": (
+            round(percentile(chunk_gaps, 0.50) * 1000, 1) if chunk_gaps else None
+        ),
+        "inter_chunk_p95_ms": (
+            round(percentile(chunk_gaps, 0.95) * 1000, 1) if chunk_gaps else None
+        ),
+        "inter_chunk_max_ms": round(max(chunk_gaps) * 1000, 1) if chunk_gaps else None,
+        "visible_stall_p95_ms": (
+            round(percentile(visible_gaps, 0.95) * 1000, 1) if visible_gaps else None
+        ),
+        "prefill_tps": prefill_tps,
+        "output_tps": output_tps,
+        "reasoning_tps": reasoning_tps,
+        "content_tps": content_tps,
+        "tpot_ms": tpot_ms,
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "reasoning_tokens": reasoning_tokens,
-        "prefill_tps": round(prefill_tps, 1) if prefill_tps is not None else None,
-        "output_tps": round(output_tps, 1) if output_tps is not None else None,
-        "reasoning_tps": round(reasoning_tps, 1) if reasoning_tps is not None else None,
-        "content_tps": round(content_tps, 1) if content_tps is not None else None,
-        "estimated": estimated,
+        "content_tokens": content_tokens,
+        "cached_tokens": cached_tokens,
+        "cache_write_tokens": cache_write_tokens,
+        "cache_hit_percent": cache_hit_percent,
+        "cost_usd": cost_usd,
+        "output_chunks": output_events,
+        "content_chunks": content_chunks,
+        "reasoning_chunks": reasoning_chunks,
+        "tool_chunks": tool_chunks,
         "finish_reason": finish_reason,
     }
 
 
 def aggregate(samples):
-    """Median of each numeric field, plus the last tool name and finish reason."""
+    """Return median numeric fields and labels shared by every sample."""
     median = {}
     for key in NUMERIC_KEYS:
         values = [sample[key] for sample in samples if sample.get(key) is not None]
@@ -380,13 +517,24 @@ def aggregate(samples):
             median[key] = None
         elif key in TOKEN_KEYS:
             median[key] = int(round(statistics.median(values)))
+        elif key == "cost_usd":
+            median[key] = statistics.median(values)
         else:
             median[key] = round(statistics.median(values), 1)
-    median["tool_name"] = next(
-        (sample["tool_name"] for sample in samples if sample.get("tool_name")), None
+    tool_names = {sample.get("tool_name") for sample in samples}
+    finish_reasons = {sample.get("finish_reason") for sample in samples}
+    median["tool_name"] = tool_names.pop() if len(tool_names) == 1 else None
+    median["finish_reason"] = (
+        finish_reasons.pop() if len(finish_reasons) == 1 else None
     )
-    median["estimated"] = any(sample.get("estimated") for sample in samples)
-    median["finish_reason"] = samples[-1].get("finish_reason")
+    cache_values = [
+        sample["cache_hit_percent"]
+        for sample in samples
+        if sample.get("cache_hit_percent") is not None
+    ]
+    median["cache_hit_percent"] = (
+        round(statistics.median(cache_values), 1) if cache_values else None
+    )
     return median
 
 
@@ -406,11 +554,11 @@ def fmt_seconds(value_ms):
     return f"{value_ms / 1000:,.2f} s"
 
 
-def fmt_tps(value, estimated=False):
+def fmt_tps(value):
     if value is None:
         return "n/a"
     number = f"{value:,.0f}" if value >= 100 else f"{value:,.1f}"
-    return ("~" if estimated else "") + number + " tok/s"
+    return number + " tok/s"
 
 
 def metric(label, value, note=""):
@@ -444,20 +592,31 @@ def render(results, cfg):
         med = result["median"]
 
         print(metric("TTFT", fmt_ms(med["ttft_ms"]), ttft_span(samples)))
+        if len(samples) > 1:
+            print(metric("TTFT p95", fmt_ms(result["p95"]["ttft_ms"])))
         print(metric("first content", fmt_ms(med["first_content_ms"])))
+        print(metric("first usable", fmt_ms(med["first_usable_ms"])))
         if med["tool_ready_ms"] is not None:
             note = f"({med['tool_name']})" if med.get("tool_name") else ""
             print(metric("tool call ready", fmt_seconds(med["tool_ready_ms"]), note))
         if med["prefill_tps"] is not None:
             note = f"({int(med['prompt_tokens']):,} prompt tok)"
-            print(metric("prefill", fmt_tps(med["prefill_tps"], med["estimated"]), note))
+            print(metric("prefill", fmt_tps(med["prefill_tps"]), note))
         else:
             print(metric("prefill", "n/a"))
         if med["output_tps"] is not None:
             note = f"({int(med['completion_tokens']):,} tok)"
-            print(metric("output", fmt_tps(med["output_tps"], med["estimated"]), note))
+            print(metric("output", fmt_tps(med["output_tps"]), note))
         else:
             print(metric("output", "n/a"))
+        if med["tpot_ms"] is not None:
+            print(metric("TPOT", fmt_ms(med["tpot_ms"])))
+        print(metric("decode time", fmt_ms(med["decode_ms"])))
+        if med["inter_chunk_p95_ms"] is not None:
+            print(metric("chunk gap p95", fmt_ms(med["inter_chunk_p95_ms"])))
+            print(metric("max chunk gap", fmt_ms(med["inter_chunk_max_ms"])))
+        if med["visible_stall_p95_ms"] is not None:
+            print(metric("visible stall p95", fmt_ms(med["visible_stall_p95_ms"])))
         if med["reasoning_tokens"]:
             rate = fmt_tps(med["reasoning_tps"])
             print(metric("reasoning", f"{int(med['reasoning_tokens']):,} tok @ {rate}"))
@@ -466,11 +625,17 @@ def render(results, cfg):
             print(
                 metric(
                     "content",
-                    fmt_tps(med["content_tps"], med["estimated"]),
+                    fmt_tps(med["content_tps"]),
                     f"({visible:,} tok)",
                 )
             )
+        if med["cache_hit_percent"] is not None:
+            print(metric("cache hit", f"{med['cache_hit_percent']:.1f}%"))
+        if med["cost_usd"] is not None:
+            print(metric("cost", f"${med['cost_usd']:.6f}"))
         print(metric("end-to-end", fmt_seconds(med["e2e_ms"])))
+        if len(samples) > 1:
+            print(metric("E2E p95", fmt_seconds(result["p95"]["e2e_ms"])))
     print()
     print("Effective rates include network delay and queue time.")
 
@@ -783,6 +948,17 @@ def main(argv=None):
                     "name": scenario["name"],
                     "samples": samples,
                     "median": aggregate(samples),
+                    "p95": {
+                        "ttft_ms": percentile_ms(samples, "ttft_ms", 0.95),
+                        "first_content_ms": percentile_ms(
+                            samples, "first_content_ms", 0.95
+                        ),
+                        "first_usable_ms": percentile_ms(
+                            samples, "first_usable_ms", 0.95
+                        ),
+                        "tool_ready_ms": percentile_ms(samples, "tool_ready_ms", 0.95),
+                        "e2e_ms": percentile_ms(samples, "e2e_ms", 0.95),
+                    },
                 }
             )
             if error:

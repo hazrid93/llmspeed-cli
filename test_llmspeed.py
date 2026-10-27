@@ -4,10 +4,14 @@
 import contextlib
 import io
 import json
+import os
+import tempfile
 import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from unittest import mock
 
 import llmspeed
 
@@ -17,6 +21,20 @@ class MockStream(BaseHTTPRequestHandler):
 
     def log_message(self, *args):
         pass
+
+    def do_GET(self):
+        if self.headers.get("Authorization") != "Bearer test-key":
+            payload = b'{"error": {"message": "invalid api key"}}'
+            self.send_response(401)
+        else:
+            payload = json.dumps(
+                {"object": "list", "data": [{"id": "mock-a"}, {"id": "mock-b"}]}
+            ).encode()
+            self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
 
     def do_POST(self):
         length = int(self.headers.get("content-length", 0))
@@ -191,6 +209,42 @@ class LlmspeedTest(unittest.TestCase):
         )
         self.assertNotIn("max_tokens", body)
         self.assertEqual(body["max_completion_tokens"], 100)
+
+    def test_provider_preset(self):
+        args = llmspeed.parse_args(["--provider", "coralbricks", "--model", "m"])
+        cfg = llmspeed.build_config(args, {})
+        self.assertEqual(cfg["base_url"], "https://inference.coralbricks.ai/v1")
+        self.assertEqual(cfg["api_key_env"], "CORAL_API_KEY")
+
+    def test_unknown_provider(self):
+        args = llmspeed.parse_args(["--provider", "nope", "--model", "m"])
+        with self.assertRaises(llmspeed.SpeedError):
+            llmspeed.build_config(args, {})
+
+    def test_list_models(self):
+        self.assertEqual(
+            llmspeed.list_models(self.base_url, "test-key"), ["mock-a", "mock-b"]
+        )
+
+    def test_interactive_setup_saves_without_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "speedtest.json"
+            args = llmspeed.parse_args(
+                ["--provider", "custom", "--base-url", self.base_url, "-c", str(target)]
+            )
+            with mock.patch("builtins.input", side_effect=["2", "y"]), mock.patch(
+                "llmspeed.getpass.getpass", return_value="test-key"
+            ), mock.patch.dict(os.environ, {"LLMSPEED_API_KEY": "", "OPENAI_API_KEY": ""}), contextlib.redirect_stdout(
+                io.StringIO()
+            ), contextlib.redirect_stderr(io.StringIO()):
+                conf = llmspeed.interactive_setup(args, {})
+            self.assertEqual(conf["model"], "mock-b")
+            self.assertEqual(conf["api_key"], "test-key")
+            saved = json.loads(target.read_text())
+            self.assertNotIn("api_key", saved)
+            self.assertEqual(saved["base_url"], self.base_url)
+            self.assertEqual(saved["model"], "mock-b")
+            self.assertEqual(saved["api_key_env"], "OPENAI_API_KEY")
 
     def test_json_cli(self):
         stdout = io.StringIO()

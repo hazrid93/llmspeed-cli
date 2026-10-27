@@ -9,6 +9,7 @@ end-to-end time.
 from __future__ import annotations
 
 import argparse
+import getpass
 import http.client
 import json
 import os
@@ -25,6 +26,22 @@ DEFAULT_RUNS = 3
 DEFAULT_TIMEOUT = 120.0
 DEFAULT_MAX_TOKENS = 256
 LABEL_WIDTH = 20
+CUSTOM_KEY_ENV = "OPENAI_API_KEY"
+
+PROVIDERS = {
+    "coralbricks": {
+        "label": "CoralBricks",
+        "base_url": "https://inference.coralbricks.ai/v1",
+        "api_key_env": "CORAL_API_KEY",
+        "models": ["deepseek-v4.1-flash-fast", "deepseek-v4.1-flash"],
+    },
+}
+CUSTOM_PROVIDER = {
+    "label": "Custom OpenAI-compatible endpoint",
+    "base_url": "",
+    "api_key_env": CUSTOM_KEY_ENV,
+    "models": [],
+}
 
 NUMERIC_KEYS = (
     "ttft_ms",
@@ -99,6 +116,44 @@ def chat_url(base_url):
     if base.endswith("/chat/completions"):
         return base
     return base + "/chat/completions"
+
+
+def get_provider(name):
+    if name == "custom":
+        return CUSTOM_PROVIDER
+    if name in PROVIDERS:
+        return PROVIDERS[name]
+    known = ", ".join([*PROVIDERS, "custom"])
+    raise SpeedError(f'unknown provider "{name}". Known providers: {known}')
+
+
+def list_models(base_url, api_key, timeout=30):
+    """Return the model ids from GET /models."""
+    url = base_url.rstrip("/") + "/models"
+    headers = {"Accept": "application/json", "User-Agent": f"llmspeed/{VERSION}"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    try:
+        with urllib.request.urlopen(
+            urllib.request.Request(url, headers=headers), timeout=timeout
+        ) as response:
+            payload = json.load(response)
+    except urllib.error.HTTPError as error:
+        with error:
+            detail = error.read().decode("utf-8", "replace").strip()
+        raise SpeedError(
+            f"cannot read the model list (HTTP {error.code}): {detail[:300]}"
+        ) from None
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as error:
+        raise SpeedError(f"cannot read the model list from {url}: {error}") from None
+
+    rows = payload.get("data") if isinstance(payload, dict) else payload
+    models = [
+        row["id"] for row in rows or [] if isinstance(row, dict) and row.get("id")
+    ]
+    if not models:
+        raise SpeedError("the model list is empty")
+    return models
 
 
 def build_body(model, scenario):
@@ -434,9 +489,143 @@ def load_config(path):
     return conf
 
 
+def ask(text, default=""):
+    suffix = f" [{default}]" if default else ""
+    answer = input(f"{text}{suffix}: ").strip()
+    return answer or default
+
+
+def confirm(text, default=False):
+    mark = "[Y/n]" if default else "[y/N]"
+    answer = input(f"{text} {mark}: ").strip().lower()
+    if not answer:
+        return default
+    return answer in ("y", "yes")
+
+
+def interactive_setup(args, conf):
+    """Ask for a provider, API key, and model. Return an updated config."""
+    if args.provider:
+        provider_name = args.provider
+        preset = get_provider(provider_name)
+    else:
+        names = [*PROVIDERS, "custom"]
+        print("Select a provider:")
+        for index, name in enumerate(names, 1):
+            item = get_provider(name)
+            place = item["base_url"] or "enter your own URL"
+            print(f"  {index}. {item['label']} ({place})")
+        choice = ask("Provider", "2" if args.base_url else "1")
+        if choice.isdigit() and 1 <= int(choice) <= len(names):
+            provider_name = names[int(choice) - 1]
+        else:
+            provider_name = choice
+        preset = get_provider(provider_name)
+
+    if provider_name == "custom":
+        base_url = (
+            args.base_url
+            or conf.get("base_url")
+            or ask("Base URL", "http://localhost:8000/v1")
+        )
+    else:
+        base_url = args.base_url or preset["base_url"]
+
+    if provider_name == "custom":
+        key_env = args.api_key_env or conf.get("api_key_env") or CUSTOM_KEY_ENV
+    else:
+        key_env = (
+            args.api_key_env
+            or preset["api_key_env"]
+            or conf.get("api_key_env")
+            or CUSTOM_KEY_ENV
+        )
+    api_key = args.api_key
+    if not api_key and os.environ.get(key_env):
+        api_key = os.environ[key_env]
+        print(f"Using {key_env} from the environment.")
+    elif not api_key:
+        label = f"{preset['label']} API key"
+        if provider_name == "custom":
+            label += " (blank for none)"
+        api_key = getpass.getpass(f"{label}: ").strip()
+        if not api_key and provider_name != "custom":
+            raise SpeedError(f"no API key. Set {key_env} or enter a key.")
+
+    model = args.model
+    if not model:
+        models = []
+        try:
+            models = list_models(base_url, api_key)
+        except SpeedError as error:
+            print(f"llmspeed: {error}", file=sys.stderr)
+            models = preset.get("models", [])
+            if models:
+                print("Using the documented model list.")
+        if models:
+            print("Available models:")
+            for index, model_id in enumerate(models, 1):
+                print(f"  {index}. {model_id}")
+            choice = ask("Model", models[0])
+            if choice.isdigit() and 1 <= int(choice) <= len(models):
+                model = models[int(choice) - 1]
+            else:
+                model = choice
+        else:
+            model = ask("Model id")
+        if not model:
+            raise SpeedError("no model selected")
+
+    updated = dict(conf)
+    updated.update(
+        {
+            "base_url": base_url,
+            "model": model,
+            "api_key_env": key_env,
+            "api_key": api_key,
+        }
+    )
+
+    target = Path(args.config) if args.config else Path("speedtest.json")
+    if confirm(f"Save these settings to {target}?"):
+        if target.exists() and not confirm(f"{target} exists. Overwrite?"):
+            return updated
+        data = {
+            "base_url": base_url,
+            "model": model,
+            "api_key_env": key_env,
+            "runs": args.runs
+            if args.runs is not None
+            else conf.get("runs", DEFAULT_RUNS),
+            "timeout": args.timeout
+            if args.timeout is not None
+            else conf.get("timeout", DEFAULT_TIMEOUT),
+        }
+        if conf.get("scenarios"):
+            data["scenarios"] = conf["scenarios"]
+        try:
+            target.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        except OSError as error:
+            raise SpeedError(f"cannot write {target}: {error}") from None
+        print(
+            f"Wrote {target}. The API key is not saved. "
+            f"Set {key_env} before the next run."
+        )
+    return updated
+
+
 def build_config(args, conf):
+    preset = get_provider(args.provider) if args.provider else None
+    if args.provider == "custom" and not (
+        args.base_url
+        or conf.get("base_url")
+        or os.environ.get("LLMSPEED_BASE_URL")
+        or os.environ.get("OPENAI_BASE_URL")
+    ):
+        raise SpeedError("no base URL for the custom provider. Set --base-url.")
     base_url = (
         args.base_url
+        or (preset["base_url"] if preset else None)
         or conf.get("base_url")
         or os.environ.get("LLMSPEED_BASE_URL")
         or os.environ.get("OPENAI_BASE_URL")
@@ -444,8 +633,16 @@ def build_config(args, conf):
     )
     model = args.model or conf.get("model")
     if not model:
-        raise SpeedError('no model. Set --model or "model" in the config file.')
-    key_env = args.api_key_env or conf.get("api_key_env") or "OPENAI_API_KEY"
+        raise SpeedError(
+            'no model. Set --model, add "model" to the config file, '
+            "or run in an interactive terminal."
+        )
+    if args.provider == "custom":
+        key_env = args.api_key_env or conf.get("api_key_env") or CUSTOM_KEY_ENV
+    elif preset:
+        key_env = args.api_key_env or preset["api_key_env"] or "OPENAI_API_KEY"
+    else:
+        key_env = args.api_key_env or conf.get("api_key_env") or "OPENAI_API_KEY"
     api_key = args.api_key or os.environ.get(key_env) or conf.get("api_key")
     runs = args.runs if args.runs is not None else conf.get("runs", DEFAULT_RUNS)
     timeout = (
@@ -495,6 +692,7 @@ def parse_args(argv):
         "first content, tool-call readiness, prefill, output, and end-to-end time.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="examples:\n"
+        "  llmspeed.py --provider coralbricks\n"
         "  llmspeed.py --base-url https://api.openai.com/v1 --model gpt-4.1-mini\n"
         "  llmspeed.py --config speedtest.json --runs 5\n"
         "  llmspeed.py --config speedtest.json --scenario chat --json\n",
@@ -504,6 +702,9 @@ def parse_args(argv):
     )
     parser.add_argument("--base-url", help="API root, for example https://host/v1")
     parser.add_argument("--model", help="model name")
+    parser.add_argument(
+        "--provider", help="provider preset: coralbricks or custom"
+    )
     parser.add_argument("--api-key", help="API key (prefer --api-key-env)")
     parser.add_argument(
         "--api-key-env", help="environment variable that holds the API key"
@@ -525,6 +726,18 @@ def main(argv=None):
     args = parse_args(argv)
     try:
         conf = load_config(args.config)
+        if not (args.model or conf.get("model")):
+            if args.json or not sys.stdin.isatty():
+                raise SpeedError(
+                    'no model. Set --model, add "model" to the config file, '
+                    "or run in an interactive terminal."
+                )
+            try:
+                conf = interactive_setup(args, conf)
+            except EOFError:
+                raise SpeedError(
+                    "input ended before the setup was complete"
+                ) from None
         cfg = build_config(args, conf)
         scenarios = select_scenarios(conf, args.scenario)
     except SpeedError as error:

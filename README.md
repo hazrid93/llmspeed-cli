@@ -25,18 +25,46 @@ Python 3.10 or later. The tool uses only the Python standard library.
 
 ## Quick start
 
+CoralBricks:
+
 ```bash
 git clone https://github.com/hazrid93/llmspeed-cli.git
-cd llmspeed
+cd llmspeed-cli
+export CORAL_API_KEY=cb_...
+python3 llmspeed.py --provider coralbricks
+```
+
+The tool asks for a model from the endpoint model list.
+
+OpenAI:
+
+```bash
 export OPENAI_API_KEY=sk-...
 python3 llmspeed.py --base-url https://api.openai.com/v1 --model gpt-4.1-mini
 ```
 
-For a local endpoint:
+Local endpoint:
 
 ```bash
 python3 llmspeed.py --base-url http://localhost:8000/v1 --model my-model --runs 5
 ```
+
+## Providers
+
+Known providers set the endpoint and the API key variable:
+
+| Provider | Endpoint | API key variable |
+| --- | --- | --- |
+| `coralbricks` | `https://inference.coralbricks.ai/v1` | `CORAL_API_KEY` |
+| `custom` | your URL | `OPENAI_API_KEY` |
+
+Use `--provider NAME`. For a custom endpoint, also set `--base-url`.
+
+If no model is configured and the terminal is interactive, the tool asks for the provider, the API key, and a model. It reads the model list from `GET /models`. It can save the result to `speedtest.json`. The setup wizard does not write the API key to the file.
+
+CoralBricks docs: https://www.coralbricks.ai/docs
+
+The shared models are `deepseek-v4.1-flash-fast` and `deepseek-v4.1-flash`. Add `"reasoning_effort": "high"` to a scenario to measure reasoning tokens.
 
 ## Configuration
 
@@ -54,8 +82,8 @@ python3 llmspeed.py --config speedtest.json
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `base_url` | `https://api.openai.com/v1` | API root. The tool adds `/chat/completions`. |
-| `model` | required | Model name. |
-| `api_key_env` | `OPENAI_API_KEY` | Environment variable that holds the API key. |
+| `model` | required for non-interactive use | Model name. |
+| `api_key_env` | `OPENAI_API_KEY` | Environment variable that holds the API key. A provider preset can change the name. |
 | `api_key` | none | API key in the file. Use only for local endpoints. |
 | `runs` | `3` | Number of requests for each scenario. |
 | `timeout` | `120` | Timeout in seconds for each request. |

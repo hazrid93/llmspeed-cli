@@ -12,8 +12,9 @@ llmspeed sends chat requests to an OpenAI-compatible endpoint and reads the even
 - **First content**: time to the first visible token. Reasoning tokens do not count.
 - **Tool call ready**: time to the complete tool call. An agent can act at this time.
 - **Prefill**: effective input rate. The value is prompt tokens divided by TTFT. The value includes network delay and queue time.
-- **Output**: effective output rate. The value is output tokens divided by the time after TTFT. The value includes reasoning tokens and tool-call tokens.
+- **Output**: effective output rate. The value is output tokens divided by the time from the first token to the end of the stream. The value includes reasoning tokens and tool-call tokens.
 - **Reasoning**: reasoning token count and rate, when the endpoint reports them.
+- **Content**: effective rate for tokens after the reasoning phase. The rate is the completion token count minus the reasoning token count. The divisor is the time from first content to the end of the stream.
 - **End-to-end**: time from the request to the last stream event.
 
 The tool shows the median of 3 runs by default.
@@ -46,7 +47,7 @@ cp speedtest.example.json speedtest.json
 python3 llmspeed.py --config speedtest.json
 ```
 
-`speedtest.json` is in `.gitignore`. Do not commit API keys.
+`speedtest.json` is in `.gitignore`. Do not commit API keys. If `speedtest.json` exists in the current directory, the tool uses it automatically.
 
 ### Top-level keys
 
@@ -91,6 +92,15 @@ chat · median of 3
   output .............. 94.2 tok/s  (256 tok)
   end-to-end .......... 3.13 s
 
+reasoning · median of 3
+  TTFT ................ 1.24 s
+  first content ....... 12.10 s
+  prefill ............. 310 tok/s  (384 prompt tok)
+  output .............. 67.5 tok/s  (1,536 tok)
+  reasoning ........... 1,024 tok @ 94.3 tok/s
+  content ............. 43.0 tok/s  (512 tok)
+  end-to-end .......... 24.00 s
+
 tool-call · median of 3
   TTFT ................ 980 ms
   first content ....... n/a
@@ -115,8 +125,9 @@ The output has one entry for each scenario and each run. Exit codes: 0 for succe
 ## Metric details
 
 - The TTFT timer starts before the tool sends the request. It stops at the first event with visible content, reasoning content, or tool-call data. A role-only event does not count.
-- The output rate uses the time after TTFT. Thus the value includes inter-token delay and the final stream gap.
+- The output rate uses the time from the first token to the end of the stream. Thus the value includes inter-token delay and the final stream gap.
 - The reasoning rate uses reasoning tokens divided by the reasoning time. The reasoning time starts at TTFT and stops at the first visible content or tool call.
+- The content rate uses completion tokens minus reasoning tokens. The time starts at first content and stops at the end of the stream.
 - Token counts come from the `usage` object. If the endpoint does not send `usage`, the tool counts stream chunks and marks the value with `~`.
 - Reasoning tokens come from `completion_tokens_details.reasoning_tokens`. Some gateways put `reasoning_tokens` at the top level of `usage`. The tool reads both.
 - llmspeed does not execute tools. The tool-call value stops when the tool call is complete.

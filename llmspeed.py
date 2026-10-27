@@ -37,6 +37,7 @@ NUMERIC_KEYS = (
     "prefill_tps",
     "output_tps",
     "reasoning_tps",
+    "content_tps",
 )
 TOKEN_KEYS = {"prompt_tokens", "completion_tokens", "reasoning_tokens"}
 
@@ -129,7 +130,8 @@ def open_stream(url, body, api_key, timeout):
         try:
             return urllib.request.urlopen(request, timeout=timeout)
         except urllib.error.HTTPError as error:
-            detail = error.read().decode("utf-8", "replace").strip()
+            with error:
+                detail = error.read().decode("utf-8", "replace").strip()
             if (
                 attempt == 0
                 and error.code in (400, 422)
@@ -254,6 +256,8 @@ def run_once(cfg, scenario, timeout=DEFAULT_TIMEOUT):
 
     estimated = False
     if not completion_tokens:
+        # ponytail: chunk counts approximate tokens without usage data. Exact
+        # counts need a tokenizer or provider support.
         estimated = True
         tool_tokens = round(tool_chars / 4) if tool_chars else 0
         completion_tokens = (
@@ -279,6 +283,14 @@ def run_once(cfg, scenario, timeout=DEFAULT_TIMEOUT):
         if reasoning_tokens and visible_at is not None and visible_at > ttft
         else None
     )
+    # ponytail: the content split is completion minus reasoning, because
+    # providers do not report content tokens separately.
+    content_tokens = completion_tokens - reasoning_tokens
+    content_tps = (
+        content_tokens / (end - first_content)
+        if content_tokens and first_content is not None and end > first_content
+        else None
+    )
 
     return {
         "ttft_ms": round(ttft * 1000, 1),
@@ -296,6 +308,7 @@ def run_once(cfg, scenario, timeout=DEFAULT_TIMEOUT):
         "prefill_tps": round(prefill_tps, 1) if prefill_tps is not None else None,
         "output_tps": round(output_tps, 1) if output_tps is not None else None,
         "reasoning_tps": round(reasoning_tps, 1) if reasoning_tps is not None else None,
+        "content_tps": round(content_tps, 1) if content_tps is not None else None,
         "estimated": estimated,
         "finish_reason": finish_reason,
     }
@@ -356,15 +369,6 @@ def ttft_span(samples):
     return f"[{min(values):,.0f}-{max(values):,.0f} ms]"
 
 
-def output_span(samples):
-    values = [
-        sample["output_tps"] for sample in samples if sample.get("output_tps") is not None
-    ]
-    if len(values) < 2:
-        return ""
-    return f"[{min(values):,.0f}-{max(values):,.0f} tok/s]"
-
-
 def render(results, cfg):
     print(f"llmspeed {VERSION} · {cfg['model']}")
     print(f"{cfg['base_url']} · {cfg['runs']} run(s) per scenario")
@@ -400,6 +404,15 @@ def render(results, cfg):
         if med["reasoning_tokens"]:
             rate = fmt_tps(med["reasoning_tps"])
             print(metric("reasoning", f"{int(med['reasoning_tokens']):,} tok @ {rate}"))
+        if med["reasoning_tokens"] and med["content_tps"] is not None:
+            visible = int(med["completion_tokens"]) - int(med["reasoning_tokens"])
+            print(
+                metric(
+                    "content",
+                    fmt_tps(med["content_tps"], med["estimated"]),
+                    f"({visible:,} tok)",
+                )
+            )
         print(metric("end-to-end", fmt_seconds(med["e2e_ms"])))
     print()
     print("Effective rates include network delay and queue time.")

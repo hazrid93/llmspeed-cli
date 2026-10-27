@@ -21,6 +21,14 @@ class MockStream(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("content-length", 0))
         body = json.loads(self.rfile.read(length) or b"{}")
+        if body.get("model") == "retry" and "stream_options" in body:
+            payload = b'{"error": {"message": "stream_options is not supported"}}'
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
@@ -148,6 +156,7 @@ class LlmspeedTest(unittest.TestCase):
         self.assertGreater(sample["first_content_ms"], sample["ttft_ms"])
         self.assertGreater(sample["output_tps"], 0)
         self.assertGreater(sample["reasoning_tps"], 0)
+        self.assertGreater(sample["content_tps"], 0)
         self.assertFalse(sample["estimated"])
         self.assertEqual(sample["finish_reason"], "stop")
 
@@ -168,6 +177,20 @@ class LlmspeedTest(unittest.TestCase):
         self.assertGreaterEqual(sample["tool_ready_ms"], sample["ttft_ms"])
         self.assertIsNone(sample["first_content_ms"])
         self.assertEqual(sample["finish_reason"], "tool_calls")
+
+    def test_stream_options_retry(self):
+        cfg = dict(self.cfg, model="retry")
+        sample = llmspeed.run_once(cfg, llmspeed.BUILTIN_SCENARIOS[0], 10)
+        self.assertEqual(sample["completion_tokens"], 10)
+        self.assertFalse(sample["estimated"])
+
+    def test_max_completion_tokens(self):
+        body = llmspeed.build_body(
+            "model",
+            {"name": "x", "max_completion_tokens": 100, "messages": []},
+        )
+        self.assertNotIn("max_tokens", body)
+        self.assertEqual(body["max_completion_tokens"], 100)
 
     def test_json_cli(self):
         stdout = io.StringIO()

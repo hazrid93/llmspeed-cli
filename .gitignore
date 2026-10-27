@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+speedtest.json
+result.json
+.DS_Store

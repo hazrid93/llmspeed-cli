@@ -1,0 +1,58 @@
+{
+  "base_url": "https://api.openai.com/v1",
+  "model": "gpt-4.1-mini",
+  "api_key_env": "OPENAI_API_KEY",
+  "runs": 3,
+  "timeout": 120,
+  "scenarios": [
+    {
+      "name": "chat",
+      "max_tokens": 256,
+      "messages": [
+        {
+          "role": "user",
+          "content": "Explain in two short paragraphs why tail latency matters for interactive applications."
+        }
+      ]
+    },
+    {
+      "name": "reasoning",
+      "max_tokens": 1024,
+      "messages": [
+        {
+          "role": "user",
+          "content": "A train leaves at 09:15 and travels 312 km at 96 km/h. It stops for 12 minutes. At what time does it arrive? Show your work."
+        }
+      ]
+    },
+    {
+      "name": "tool-call",
+      "max_tokens": 256,
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is the weather in Kuala Lumpur right now?"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": ["city"]
+            }
+          }
+        }
+      ],
+      "tool_choice": "auto"
+    }
+  ]
+}

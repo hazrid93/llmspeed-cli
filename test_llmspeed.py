@@ -246,6 +246,29 @@ class LlmspeedTest(unittest.TestCase):
             self.assertEqual(saved["model"], "mock-b")
             self.assertEqual(saved["api_key_env"], "OPENAI_API_KEY")
 
+    def test_wizard_keyboard_interrupt(self):
+        class TTY(io.StringIO):
+            def isatty(self):
+                return True
+
+        stderr = io.StringIO()
+        with mock.patch("llmspeed.load_config", return_value={}), mock.patch.dict(
+            os.environ, {"OPENAI_API_KEY": ""}
+        ), mock.patch(
+            "llmspeed.getpass.getpass", side_effect=KeyboardInterrupt
+        ), mock.patch.object(
+            llmspeed.sys, "stdin", TTY()
+        ), contextlib.redirect_stdout(
+            io.StringIO()
+        ), contextlib.redirect_stderr(
+            stderr
+        ):
+            code = llmspeed.main(
+                ["--provider", "custom", "--base-url", self.base_url]
+            )
+        self.assertEqual(code, 2)
+        self.assertIn("setup stopped", stderr.getvalue())
+
     def test_json_cli(self):
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):

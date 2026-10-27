@@ -738,6 +738,8 @@ def main(argv=None):
                 raise SpeedError(
                     "input ended before the setup was complete"
                 ) from None
+            except KeyboardInterrupt:
+                raise SpeedError("setup stopped") from None
         cfg = build_config(args, conf)
         scenarios = select_scenarios(conf, args.scenario)
     except SpeedError as error:

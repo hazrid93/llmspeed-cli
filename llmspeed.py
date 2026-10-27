@@ -569,7 +569,7 @@ def interactive_setup(args, conf):
             for index, model_id in enumerate(models, 1):
                 print(f"  {index}. {model_id}")
             while not model:
-                choice = input("Model (number or id): ").strip()
+                choice = ask("Model (number or id)")
                 if not choice:
                     print("Select a model.")
                 elif choice.isdigit() and 1 <= int(choice) <= len(models):
@@ -578,7 +578,7 @@ def interactive_setup(args, conf):
                     model = choice
         else:
             while not model:
-                model = input("Model id: ").strip()
+                model = ask("Model id")
                 if not model:
                     print("Enter a model id.")
 

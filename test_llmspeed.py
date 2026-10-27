@@ -297,6 +297,38 @@ class LlmspeedTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("setup stopped", stderr.getvalue())
 
+    def test_no_model_non_interactive_exits_2(self):
+        stderr = io.StringIO()
+        with mock.patch("llmspeed.load_config", return_value={}), mock.patch.object(
+            llmspeed.sys, "stdin", io.StringIO()
+        ), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+            stderr
+        ):
+            code = llmspeed.main(["--provider", "coralbricks"])
+        self.assertEqual(code, 2)
+        self.assertIn("no model", stderr.getvalue())
+
+    def test_wizard_eof_exits_2(self):
+        class TTY(io.StringIO):
+            def isatty(self):
+                return True
+
+        stderr = io.StringIO()
+        with mock.patch("llmspeed.load_config", return_value={}), mock.patch.dict(
+            os.environ, {"CORAL_API_KEY": ""}
+        ), mock.patch(
+            "llmspeed.getpass.getpass", side_effect=EOFError
+        ), mock.patch.object(
+            llmspeed.sys, "stdin", TTY()
+        ), contextlib.redirect_stdout(
+            io.StringIO()
+        ), contextlib.redirect_stderr(
+            stderr
+        ):
+            code = llmspeed.main(["--provider", "coralbricks"])
+        self.assertEqual(code, 2)
+        self.assertIn("input ended", stderr.getvalue())
+
     def test_json_cli(self):
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):

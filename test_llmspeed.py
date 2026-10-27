@@ -329,6 +329,38 @@ class LlmspeedTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("input ended", stderr.getvalue())
 
+    def test_model_prompt_eof_exits_2(self):
+        class TTY(io.StringIO):
+            def isatty(self):
+                return True
+
+        stderr = io.StringIO()
+        with mock.patch("llmspeed.load_config", return_value={}), mock.patch.dict(
+            os.environ, {"CORAL_API_KEY": "test-key"}
+        ), mock.patch(
+            "llmspeed.list_models", return_value=["mock-a", "mock-b"]
+        ), mock.patch(
+            "llmspeed.ask", side_effect=EOFError
+        ), mock.patch.object(
+            llmspeed.sys, "stdin", TTY()
+        ), contextlib.redirect_stdout(
+            io.StringIO()
+        ), contextlib.redirect_stderr(
+            stderr
+        ):
+            code = llmspeed.main(["--provider", "coralbricks"])
+        self.assertEqual(code, 2)
+        self.assertIn("input ended", stderr.getvalue())
+
+    def test_help_shows_options(self):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout), self.assertRaises(
+            SystemExit
+        ) as raised:
+            llmspeed.parse_args(["--help"])
+        self.assertEqual(raised.exception.code, 0)
+        self.assertIn("--reasoning-effort", stdout.getvalue())
+
     def test_json_cli(self):
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):

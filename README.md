@@ -1,27 +1,10 @@
 # llmspeed
 
-A speed test for LLM endpoints. It shows the time that a user waits. It also separates reasoning tokens, visible content, and tool calls.
+A speed test for OpenAI-compatible LLM endpoints. It measures the full request, not only TTFT and tokens per second.
 
-TTFT and tokens per second do not show interactive latency. A reasoning model can decode fast and still show the first useful token late. A tool call adds more time before an agent can act. llmspeed reports the full request time and the important checkpoints.
+TTFT alone does not show interactive latency. A reasoning model can decode fast and still show the first useful token late. A tool call adds time before an agent can act. llmspeed reports reasoning, content, and tool-call time separately.
 
-## What it measures
-
-llmspeed sends chat requests to an OpenAI-compatible endpoint and reads the event stream. It reports these values:
-
-- **TTFT**: time to the first token of any type.
-- **First content**: time to the first visible token. Reasoning tokens do not count.
-- **Tool call ready**: time to the complete tool call. An agent can act at this time.
-- **Prefill**: effective input rate. The value is prompt tokens divided by TTFT. The value includes network delay and queue time.
-- **Output**: effective output rate. The value is output tokens divided by the time from the first token to the end of the stream. The value includes reasoning tokens and tool-call tokens.
-- **Reasoning**: reasoning token count and rate, when the endpoint reports them.
-- **Content**: effective rate for tokens after the reasoning phase. The rate is the completion token count minus the reasoning token count. The divisor is the time from first content to the end of the stream.
-- **End-to-end**: time from the request to the last stream event.
-
-The tool shows the median of 3 runs by default.
-
-## Requirements
-
-Python 3.10 or later. The tool uses only the Python standard library.
+Use Python 3.10 or later. The tool uses only the Python standard library.
 
 ## Quick start
 
@@ -34,13 +17,9 @@ export CORAL_API_KEY=cb_...
 python3 llmspeed.py --provider coralbricks
 ```
 
-The tool asks you to select a model from the endpoint model list. To skip the prompt, put the model on the command line:
+The tool reads the model list from `GET /models` and asks you to select one. It never runs all models.
 
-```bash
-python3 llmspeed.py --provider coralbricks --model deepseek-v4.1-flash-fast
-```
-
-OpenAI:
+Any OpenAI-compatible endpoint:
 
 ```bash
 export OPENAI_API_KEY=sk-...
@@ -50,125 +29,117 @@ python3 llmspeed.py --base-url https://api.openai.com/v1 --model gpt-4.1-mini
 Local endpoint:
 
 ```bash
-python3 llmspeed.py --base-url http://localhost:8000/v1 --model my-model --runs 5
+python3 llmspeed.py --base-url http://localhost:8000/v1 --model my-model
+```
+
+## Help
+
+```bash
+python3 llmspeed.py --help
+```
+
+| Option | Meaning |
+| --- | --- |
+| `--provider NAME` | Provider preset: `coralbricks` or `custom`. |
+| `--base-url URL` | API root for any endpoint. |
+| `--model NAME` | Model name. Skips the model prompt. |
+| `--reasoning-effort VALUE` | Reasoning effort for every selected scenario. |
+| `--scenario NAME` | Run only this scenario. Repeatable. |
+| `--runs N` | Requests per scenario. Default `3`. |
+| `--json` | Print JSON only. |
+| `--config FILE` | Read a JSON config file. |
+
+Examples:
+
+```bash
+# Fixed model and high reasoning
+python3 llmspeed.py --provider coralbricks \
+  --model deepseek-v4.1-flash-fast \
+  --scenario reasoning \
+  --reasoning-effort high
+
+# Five runs, machine-readable
+python3 llmspeed.py --config speedtest.json --runs 5 --json > result.json
 ```
 
 ## Providers
-
-Known providers set the endpoint and the API key variable:
 
 | Provider | Endpoint | API key variable |
 | --- | --- | --- |
 | `coralbricks` | `https://inference.coralbricks.ai/v1` | `CORAL_API_KEY` |
 | `custom` | your URL | `OPENAI_API_KEY` |
 
-Use `--provider NAME`. For a custom endpoint, also set `--base-url`.
+`--provider` sets the endpoint and the key variable. For `custom`, also set `--base-url`.
 
-Set `--model NAME` to skip the model prompt. A test runs one model. If no model is set, the tool asks you to select one. It does not test all models.
-
-If no model is configured and the terminal is interactive, the tool asks for the provider, the API key, and a model. It reads the model list from `GET /models`. It can save the result to `speedtest.json`. The setup wizard does not write the API key to the file.
+With no model and an interactive terminal, the tool asks for the provider, the API key, and a model. It can save the result to `speedtest.json`. The wizard does not write the API key to the file.
 
 CoralBricks docs: https://www.coralbricks.ai/docs
 
-The shared models are `deepseek-v4.1-flash-fast` and `deepseek-v4.1-flash`. Add `"reasoning_effort": "high"` to a scenario, or use `--reasoning-effort high`. The flag applies to every selected scenario. Use `--scenario reasoning` to measure only the reasoning prompt.
+CoralBricks models: `deepseek-v4.1-flash-fast` and `deepseek-v4.1-flash`. Reasoning effort defaults to `none`. Set `--reasoning-effort high` to measure reasoning.
 
 ## Configuration
-
-Copy the example file and edit it:
 
 ```bash
 cp speedtest.example.json speedtest.json
 python3 llmspeed.py --config speedtest.json
 ```
 
-`speedtest.json` is in `.gitignore`. Do not commit API keys. If `speedtest.json` exists in the current directory, the tool uses it automatically.
-
-### Top-level keys
+`speedtest.json` is in `.gitignore`. Do not commit API keys. If the file exists in the current directory, the tool uses it automatically.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `base_url` | `https://api.openai.com/v1` | API root. The tool adds `/chat/completions`. |
-| `model` | required for non-interactive use | Model name. |
-| `api_key_env` | `OPENAI_API_KEY` | Environment variable that holds the API key. A provider preset can change the name. |
-| `api_key` | none | API key in the file. Use only for local endpoints. |
-| `runs` | `3` | Number of requests for each scenario. |
-| `timeout` | `120` | Timeout in seconds for each request. |
-| `scenarios` | built-in | List of request definitions. |
+| `base_url` | `https://api.openai.com/v1` | API root. |
+| `model` | none | Model name. Required for non-interactive use. |
+| `api_key_env` | `OPENAI_API_KEY` | Environment variable that holds the key. |
+| `api_key` | none | Key in the file. Use only for local endpoints. |
+| `runs` | `3` | Requests per scenario. |
+| `timeout` | `120` | Timeout in seconds. |
+| `scenarios` | built-in | Request definitions. |
 
-The tool reads the API key from the command line first, then from the environment variable, then from the file.
+Each scenario needs `name` and `messages`. Other keys go into the request body, for example `max_tokens`, `temperature`, `tools`, and `reasoning_effort`. Some reasoning models reject `max_tokens`. Use `max_completion_tokens` for these models.
 
-### Scenario keys
+The tool sets `stream` to `true` and requests usage with `stream_options`. If an endpoint rejects `stream_options`, it retries without it.
 
-Each scenario needs a `name` and `messages`. All other keys go into the request body. Examples: `max_tokens`, `temperature`, `top_p`, `reasoning_effort`, `tools`, `tool_choice`.
-
-Some endpoints reject `max_tokens` for reasoning models. For these endpoints, use `max_completion_tokens`:
-
-```json
-{
-  "name": "reasoning",
-  "max_completion_tokens": 1024,
-  "messages": [{"role": "user", "content": "..."}]
-}
-```
-
-llmspeed sets `stream` to `true` and requests usage data with `stream_options`. If an endpoint rejects `stream_options`, the tool retries without it.
-
-## Example output
+## Output
 
 ```text
-llmspeed 0.1.0 · gpt-4.1-mini
-https://api.openai.com/v1 · 3 run(s) per scenario
+llmspeed 0.1.0 · deepseek-v4.1-flash-fast
+https://inference.coralbricks.ai/v1 · 3 run(s) per scenario
 
 chat · median of 3
-  TTFT ................ 412 ms  [402-431 ms]
-  first content ....... 418 ms
-  prefill ............. 621 tok/s  (256 prompt tok)
-  output .............. 94.2 tok/s  (256 tok)
-  end-to-end .......... 3.13 s
-
-reasoning · median of 3
-  TTFT ................ 1.24 s
-  first content ....... 12.10 s
-  prefill ............. 310 tok/s  (384 prompt tok)
-  output .............. 67.5 tok/s  (1,536 tok)
-  reasoning ........... 1,024 tok @ 94.3 tok/s
-  content ............. 43.0 tok/s  (512 tok)
-  end-to-end .......... 24.00 s
+  TTFT ................ 1.23 s
+  first content ....... 1.23 s
+  prefill ............. 13.9 tok/s  (17 prompt tok)
+  output .............. 228 tok/s  (199 tok)
+  end-to-end .......... 2.22 s
 
 tool-call · median of 3
-  TTFT ................ 980 ms
-  first content ....... n/a
-  tool call ready ..... 1.55 s  (get_weather)
-  prefill ............. 420 tok/s  (412 prompt tok)
-  output .............. 49.2 tok/s  (31 tok)
-  end-to-end .......... 1.61 s
-
-Effective rates include network delay and queue time.
+  TTFT ................ 1.48 s
+  first content ....... 1.48 s
+  tool call ready ..... 1.56 s  (get_weather)
+  prefill ............. 187 tok/s  (276 prompt tok)
+  output .............. 710 tok/s  (52 tok)
+  end-to-end .......... 1.56 s
 ```
 
-## JSON output
+Rates are effective. Network delay and queue time are part of TTFT.
 
-Use `--json` for CI and dashboards:
+## Metrics
 
-```bash
-python3 llmspeed.py --config speedtest.json --json > result.json
-```
+| Metric | Meaning |
+| --- | --- |
+| TTFT | Time to the first token of any type. |
+| First content | Time to the first visible token. |
+| Tool call ready | Time to the complete tool call. |
+| Prefill | Prompt tokens divided by TTFT. |
+| Output | Completion tokens divided by the time from the first token to the end of the stream. |
+| Reasoning | Reasoning tokens and their rate. |
+| Content | Completion tokens minus reasoning tokens, divided by the time from first content to the end of the stream. |
+| End-to-end | Time from the request to the last stream event. |
 
-The output has one entry for each scenario and each run. Exit codes: 0 for success, 1 for a request error, 2 for a configuration error.
+The output shows the median of the runs. Token counts come from `usage`. If the endpoint does not send `usage`, the tool estimates the count and marks the rate with `~`.
 
-## Metric details
-
-- The TTFT timer starts before the tool sends the request. It stops at the first event with visible content, reasoning content, or tool-call data. A role-only event does not count.
-- The output rate uses the time from the first token to the end of the stream. Thus the value includes inter-token delay and the final stream gap.
-- The reasoning rate uses reasoning tokens divided by the reasoning time. The reasoning time starts at TTFT and stops at the first visible content or tool call.
-- The content rate uses completion tokens minus reasoning tokens. The time starts at first content and stops at the end of the stream.
-- Token counts come from the `usage` object. If the endpoint does not send `usage`, the tool counts stream chunks and marks the value with `~`.
-- Reasoning tokens come from `completion_tokens_details.reasoning_tokens`. Some gateways put `reasoning_tokens` at the top level of `usage`. The tool reads both.
-- llmspeed does not execute tools. The tool-call value stops when the tool call is complete.
-- Network delay and provider queue time are part of TTFT. Run the test near the endpoint.
-- Prompt caching changes the prefill value. State the cache condition when you compare results.
-- A cold request is slower. Use 3 or more runs and compare the median values.
-- Token counts can differ from provider dashboards because tokenizers can change.
+llmspeed does not execute tools. The tool-call value stops when the tool call is complete. Token counts can differ from provider dashboards.
 
 ## Tests
 
@@ -176,7 +147,7 @@ The output has one entry for each scenario and each run. Exit codes: 0 for succe
 python3 -m unittest -v
 ```
 
-The tests start a local mock server. They do not use a network or an API key.
+The tests use a local mock server. They do not use a network or an API key.
 
 ## License
 
